@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-Simple City Builder (single file, stdlib only)
+Pygame City Builder — single file
 
 Controls
 --------
-Left-click: place selected item
+Left-click: place selected item on grid
 Right-click: bulldoze
-Number keys 1–6: select tool
-S: Save to city_save.json
+Number keys 1–6: select tool (1 Road, 2 House, 3 Farm, 4 Factory, 5 Plant, 6 Bulldoze)
+S: Quick-save to city_save.json
 L: Load from city_save.json
 R: Reset new map
-Esc: Cycle to Bulldoze
+Esc: Switch to Bulldoze
 
 Buildings & Effects
 -------------------
@@ -20,32 +20,32 @@ Farm ($30): +3 food/tick
 Factory ($60): +10 money/tick, -2 happiness/tick, power demand 2
 Power Plant ($80): +20 power capacity (global)
 
-Powered rule (simple): If total demand <= total capacity, all demanders are powered; otherwise none are (keeps logic simple).
+Powered rule (simple): If total demand <= total capacity, all demanders are powered; otherwise none are (simple global model).
 
-Author: ChatGPT
-License: MIT (do as you wish)
+Author: ChatGPT (MIT License)
 """
 from __future__ import annotations
 import json
-import time
+import math
+import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import List, Tuple, Optional, Dict
 
-import tkinter as tk
-from tkinter import messagebox, filedialog
+import pygame as pg
 
 # -------------------------
 # Configuration
 # -------------------------
-GRID_W, GRID_H = 20, 15
-TILE = 32
-SIDEPANEL_W = 220
-HUD_H = 56
+GRID_W, GRID_H = 24, 16
+TILE = 36
+SIDEPANEL_W = 260
+HUD_H = 64
 WINDOW_W = GRID_W * TILE + SIDEPANEL_W
 WINDOW_H = GRID_H * TILE + HUD_H
 
-TICK_MS = 700  # simulation tick (ms)
+FPS = 60
+TICK_MS = 700  # simulation tick interval
 
 # Costs & economy
 COST = {
@@ -57,21 +57,29 @@ COST = {
     "PLANT": 80,
 }
 HOUSE_CAPACITY = 5
-HOUSE_TAX = 2           # per occupied house per tick
-HOUSE_FOOD_USAGE = 1    # per occupied house per tick
-FARM_FOOD = 3           # per farm per tick
-FACTORY_MONEY = 10      # per factory per tick
-FACTORY_POWER = 2       # demand
-HOUSE_POWER = 1         # demand
-PLANT_POWER = 20        # capacity
+HOUSE_TAX = 2
+HOUSE_FOOD_USAGE = 1
+FARM_FOOD = 3
+FACTORY_MONEY = 10
+FACTORY_POWER = 2
+HOUSE_POWER = 1
+PLANT_POWER = 20
 
-HAPPINESS_DECAY = 0.05  # passive pull to neutral
+HAPPINESS_DECAY = 0.05
 HAPPINESS_MAX = 100.0
 HAPPINESS_MIN = 0.0
 
-# -------------------------
-# Data Model
-# -------------------------
+SAVE_PATH = "city_save.json"
+
+# Colors
+COL_BG = (17, 17, 17)
+COL_PANEL = (22, 22, 22)
+COL_GRIDLINE = (36, 36, 36)
+COL_TEXT = (230, 230, 230)
+COL_SUB = (170, 170, 170)
+COL_ACCENT = (76, 175, 80)
+COL_WARN = (230, 100, 70)
+
 class B(Enum):
     EMPTY = auto()
     ROAD = auto()
@@ -81,26 +89,23 @@ class B(Enum):
     PLANT = auto()
 
 BUILD_ORDER = [B.ROAD, B.HOUSE, B.FARM, B.FACTORY, B.PLANT]
-TOOLS = BUILD_ORDER + [B.EMPTY]  # EMPTY tool acts as bulldozer
+TOOLS = BUILD_ORDER + [B.EMPTY]  # EMPTY is bulldoze
 
 COLOR = {
-    B.EMPTY: "#2b2b2b",
-    B.ROAD: "#8e8e8e",
-    B.HOUSE: "#4caf50",
-    B.FARM: "#a3d977",
-    B.FACTORY: "#c792ea",
-    B.PLANT: "#ffd54f",
+    B.EMPTY: (43, 43, 43),
+    B.ROAD: (142, 142, 142),
+    B.HOUSE: (76, 175, 80),
+    B.FARM: (163, 217, 119),
+    B.FACTORY: (199, 146, 234),
+    B.PLANT: (255, 213, 79),
 }
 
-OUTLINE = "#1a1a1a"
+OUTLINE = (26, 26, 26)
 
 @dataclass
 class Tile:
     kind: B = B.EMPTY
 
-# -------------------------
-# Game State
-# -------------------------
 class Game:
     def __init__(self):
         self.grid: List[List[Tile]] = [[Tile() for _ in range(GRID_W)] for _ in range(GRID_H)]
@@ -110,11 +115,12 @@ class Game:
         self.population: int = 0
         self.power_capacity: int = 0
         self.power_demand: int = 0
-        self.tool_index: int = 0  # default Road
-        self.running: bool = True
+        self.tool_index: int = 0
+        self.tick_ms_accum: int = 0
         self.tick_count: int = 0
+        self.flash_msg: Optional[str] = None
+        self.flash_timer: float = 0.0
 
-    # ----- derived counts -----
     def counts(self) -> Dict[B, int]:
         c = {b:0 for b in B}
         for y in range(GRID_H):
@@ -123,25 +129,22 @@ class Game:
         return c
 
     def adjacent_to_road(self, x: int, y: int) -> bool:
-        for dx, dy in ((1,0), (-1,0), (0,1), (0,-1)):
+        for dx, dy in ((1,0),(-1,0),(0,1),(0,-1)):
             nx, ny = x+dx, y+dy
             if 0 <= nx < GRID_W and 0 <= ny < GRID_H:
                 if self.grid[ny][nx].kind == B.ROAD:
                     return True
         return False
 
-    def compute_power(self):
-        # Global simple model
+    def compute_power(self) -> bool:
         counts = self.counts()
         capacity = counts[B.PLANT] * PLANT_POWER
         demand = counts[B.HOUSE] * HOUSE_POWER + counts[B.FACTORY] * FACTORY_POWER
         self.power_capacity = capacity
         self.power_demand = demand
-        powered = demand <= capacity
-        return powered
+        return demand <= capacity
 
     def occupied_houses(self, powered: bool) -> int:
-        # Houses require adjacency to any road and (if model says) global power
         occ = 0
         for y in range(GRID_H):
             for x in range(GRID_W):
@@ -150,21 +153,17 @@ class Game:
                         occ += 1
         return occ
 
-    # ----- Simulation tick -----
     def tick(self):
         self.tick_count += 1
         powered = self.compute_power()
-
-        # Production / consumption
         counts = self.counts()
         farms = counts[B.FARM]
         factories = counts[B.FACTORY]
 
         occ_houses = self.occupied_houses(powered)
-        # Population simply capacity of occupied houses * capacity-per-house
         self.population = occ_houses * HOUSE_CAPACITY
 
-        # Food production/consumption
+        # Food
         self.food += farms * FARM_FOOD
         food_needed = occ_houses * HOUSE_FOOD_USAGE
         fed = min(self.food, food_needed)
@@ -175,112 +174,40 @@ class Game:
         self.money += factories * FACTORY_MONEY
         self.money += occ_houses * HOUSE_TAX
 
-        # Happiness
-        # factories penalize, fed people boost; starvation penalizes more
+        # Happiness dynamics
         dh = 0.0
-        dh += occ_houses * 0.2 if powered else -occ_houses * 0.3
+        dh += occ_houses * (0.2 if powered else -0.3)
         dh += -2.0 * factories
         dh += -1.5 * starving
-        # gentle regression toward ~70 base if near neutral economy
         if self.tick_count % 5 == 0:
             if self.happiness < 70:
                 dh += 0.5
             elif self.happiness > 70:
                 dh -= 0.5
-
-        # Passive decay toward mid
         if self.happiness > 50:
             self.happiness -= HAPPINESS_DECAY
         elif self.happiness < 50:
             self.happiness += HAPPINESS_DECAY
-
         self.happiness = max(HAPPINESS_MIN, min(HAPPINESS_MAX, self.happiness + dh))
 
-# -------------------------
-# UI
-# -------------------------
+    def set_flash(self, msg: str, secs: float = 1.6):
+        self.flash_msg = msg
+        self.flash_timer = secs
+
 class App:
-    def __init__(self, root: tk.Tk):
-        self.root = root
-        self.root.title("Simple City Builder (Tkinter)")
+    def __init__(self):
+        pg.init()
+        pg.display.set_caption("Pygame City Builder")
+        self.screen = pg.display.set_mode((WINDOW_W, WINDOW_H))
+        self.clock = pg.time.Clock()
+        self.font = pg.font.SysFont(None, 22)
+        self.font_small = pg.font.SysFont(None, 18)
+        self.font_big = pg.font.SysFont(None, 28)
         self.game = Game()
+        self.running = True
 
-        self.canvas = tk.Canvas(root, width=WINDOW_W, height=WINDOW_H, bg="#111")
-        self.canvas.pack()
-
-        self.canvas.bind("<Button-1>", self.on_left_click)
-        self.canvas.bind("<Button-3>", self.on_right_click)
-        self.root.bind("<Key>", self.on_key)
-
-        self.draw_all()
-        self.schedule_tick()
-
-    # ----- Drawing -----
-    def draw_all(self):
-        self.canvas.delete("all")
-        self.draw_hud()
-        self.draw_grid()
-        self.draw_sidebar()
-        self.draw_cursor_hint()
-
-    def draw_hud(self):
-        g = self.game
-        # HUD background
-        self.canvas.create_rectangle(0, 0, WINDOW_W, HUD_H, fill="#1e1e1e", outline="")
-        powered = g.power_demand <= g.power_capacity
-
-        text = (
-            f"Money: ${g.money}    Food: {g.food}    Power: {g.power_capacity}/{g.power_demand} {'✓' if powered else '✗'}    "
-            f"Population: {g.population}    Happiness: {g.happiness:.1f}"
-        )
-        self.canvas.create_text(12, 14, anchor="w", fill="#e6e6e6", font=("TkDefaultFont", 11, "bold"), text=text)
-
-        self.canvas.create_text(12, 36, anchor="w", fill="#b0b0b0",
-                                text="1)Road  2)House  3)Farm  4)Factory  5)Plant  6)Bulldoze   S)Save  L)Load  R)Reset")
-
-    def draw_grid(self):
-        # Map area
-        y0 = HUD_H
-        for y in range(GRID_H):
-            for x in range(GRID_W):
-                tx = x * TILE
-                ty = y0 + y * TILE
-                kind = self.game.grid[y][x].kind
-                self.canvas.create_rectangle(
-                    tx, ty, tx + TILE, ty + TILE,
-                    fill=COLOR[kind], outline=OUTLINE, width=1
-                )
-                # Minimal icon glyph
-                if kind == B.HOUSE:
-                    self.canvas.create_rectangle(tx+9, ty+14, tx+23, ty+26, fill="#2e7d32", outline="")
-                    self.canvas.create_polygon(tx+8, ty+14, tx+24, ty+14, tx+16, ty+7, fill="#66bb6a", outline="")
-                elif kind == B.FARM:
-                    self.canvas.create_line(tx+6, ty+22, tx+26, ty+22)
-                    self.canvas.create_line(tx+6, ty+18, tx+26, ty+18)
-                elif kind == B.FACTORY:
-                    self.canvas.create_rectangle(tx+8, ty+18, tx+26, ty+26, fill="#9c6cd3", outline="")
-                    self.canvas.create_rectangle(tx+10, ty+12, tx+14, ty+18, fill="#b58ae6", outline="")
-                    self.canvas.create_rectangle(tx+16, ty+9, tx+20, ty+18, fill="#b58ae6", outline="")
-                elif kind == B.PLANT:
-                    self.canvas.create_oval(tx+8, ty+8, tx+24, ty+24, fill="#ffe082", outline="")
-                    self.canvas.create_line(tx+16, ty+4, tx+16, ty+28)
-                elif kind == B.ROAD:
-                    self.canvas.create_line(tx, ty+16, tx+TILE, ty+16, fill="#cfcfcf", width=3)
-
-        # Grid lines lighter overlay (optional aesthetic)
-        for x in range(GRID_W+1):
-            tx = x*TILE
-            self.canvas.create_line(tx, HUD_H, tx, HUD_H + GRID_H*TILE, fill="#222")
-        for y in range(GRID_H+1):
-            ty = HUD_H + y*TILE
-            self.canvas.create_line(0, ty, GRID_W*TILE, ty, fill="#222")
-
-    def draw_sidebar(self):
-        # Side panel
-        x0 = GRID_W * TILE
-        self.canvas.create_rectangle(x0, HUD_H, WINDOW_W, WINDOW_H, fill="#161616", outline="")
-
-        # Tool buttons
+        # Precompute sidebar button rects
+        self.buttons: List[Tuple[pg.Rect, str, B]] = []
         labels = [
             ("Road", B.ROAD),
             ("House", B.HOUSE),
@@ -289,43 +216,117 @@ class App:
             ("Power Plant", B.PLANT),
             ("Bulldoze", B.EMPTY),
         ]
+        x0 = GRID_W * TILE + 14
         for i, (label, kind) in enumerate(labels):
-            y = HUD_H + 16 + i*50
-            w = SIDEPANEL_W - 24
-            x = x0 + 12
-            y2 = y + 36
-            selected = (TOOLS[self.game.tool_index] == kind)
-            self.canvas.create_rectangle(x, y, x+w, y2, fill="#242424", outline="#333", width=2)
-            if selected:
-                self.canvas.create_rectangle(x+2, y+2, x+w-2, y2-2, outline="#4caf50", width=2)
-            self.canvas.create_text(x+12, y+18, anchor="w", fill="#e6e6e6", font=("TkDefaultFont", 11, "bold"), text=label)
-            cost = COST[kind.name] if kind != B.EMPTY else 0
-            if kind != B.EMPTY:
-                self.canvas.create_text(x+w-10, y+18, anchor="e", fill="#b0b0b0", text=f"${cost}")
+            y = HUD_H + 18 + i*56
+            rect = pg.Rect(x0, y, SIDEPANEL_W-28, 42)
+            self.buttons.append((rect, label, kind))
 
-        # Tips
-        tip_y = HUD_H + 16 + len(labels)*50 + 8
+    # ---------------- Drawing ----------------
+    def draw(self):
+        self.screen.fill(COL_BG)
+        self.draw_hud()
+        self.draw_grid()
+        self.draw_sidebar()
+        self.draw_flash()
+        pg.display.flip()
+
+    def draw_hud(self):
+        pg.draw.rect(self.screen, (30,30,30), pg.Rect(0,0,WINDOW_W,HUD_H))
+        g = self.game
+        powered = g.power_demand <= g.power_capacity
+        text = (
+            f"Money: ${g.money}   Food: {g.food}   "
+            #f"Power: {g.power_capacity}/{g.power_demand} {'\u2713' if powered else '\u2717'}   "
+            f"Population: {g.population}   Happiness: {g.happiness:.1f}"
+        )
+
+        self.blit_text(text, 12, 12, COL_TEXT, self.font_big)
+        self.blit_text("1)Road  2)House  3)Farm  4)Factory  5)Plant  6)Bulldoze   S)Save  L)Load  R)Reset", 12, 38, COL_SUB)
+
+    def draw_grid(self):
+        y0 = HUD_H
+        # tiles
+        for y in range(GRID_H):
+            for x in range(GRID_W):
+                tx = x * TILE
+                ty = y0 + y * TILE
+                kind = self.game.grid[y][x].kind
+                pg.draw.rect(self.screen, COLOR[kind], pg.Rect(tx, ty, TILE, TILE))
+                pg.draw.rect(self.screen, OUTLINE, pg.Rect(tx, ty, TILE, TILE), 1)
+                # glyphs
+                if kind == B.HOUSE:
+                    pg.draw.rect(self.screen, (46, 125, 50), pg.Rect(tx+10, ty+16, 16, 12))
+                    pg.draw.polygon(self.screen, (102, 187, 106), [(tx+8,ty+16),(tx+26,ty+16),(tx+17,ty+9)])
+                elif kind == B.FARM:
+                    pg.draw.line(self.screen, (90,90,90), (tx+6,ty+24),(tx+TILE-6,ty+24))
+                    pg.draw.line(self.screen, (90,90,90), (tx+6,ty+19),(tx+TILE-6,ty+19))
+                elif kind == B.FACTORY:
+                    pg.draw.rect(self.screen, (156,108,211), pg.Rect(tx+8,ty+20,18,10))
+                    pg.draw.rect(self.screen, (181,138,230), pg.Rect(tx+10,ty+14,5,6))
+                    pg.draw.rect(self.screen, (181,138,230), pg.Rect(tx+17,ty+11,5,9))
+                elif kind == B.PLANT:
+                    pg.draw.circle(self.screen, (255, 224, 130), (tx+18,ty+18), 10)
+                    pg.draw.line(self.screen, (200,200,200), (tx+18,ty+6),(tx+18,ty+30))
+                elif kind == B.ROAD:
+                    pg.draw.line(self.screen, (210,210,210), (tx,ty+18),(tx+TILE,ty+18), 3)
+        # gridlines overlay
+        for x in range(GRID_W+1):
+            tx = x*TILE
+            pg.draw.line(self.screen, COL_GRIDLINE, (tx, HUD_H), (tx, HUD_H + GRID_H*TILE))
+        for y in range(GRID_H+1):
+            ty = HUD_H + y*TILE
+            pg.draw.line(self.screen, COL_GRIDLINE, (0, ty), (GRID_W*TILE, ty))
+
+    def draw_sidebar(self):
+        x0 = GRID_W * TILE
+        pg.draw.rect(self.screen, COL_PANEL, pg.Rect(x0, HUD_H, SIDEPANEL_W, WINDOW_H-HUD_H))
+        # buttons
+        for i, (rect, label, kind) in enumerate(self.buttons):
+            mouse_over = rect.collidepoint(pg.mouse.get_pos())
+            base = (36,36,36) if not mouse_over else (48,48,48)
+            pg.draw.rect(self.screen, base, rect, border_radius=8)
+            pg.draw.rect(self.screen, (60,60,60), rect, 2, border_radius=8)
+            selected = (TOOLS[self.game.tool_index] == kind)
+            if selected:
+                pg.draw.rect(self.screen, COL_ACCENT, rect.inflate(-4,-4), 2, border_radius=6)
+            self.blit_text(label, rect.x+12, rect.y+10, COL_TEXT)
+            if kind != B.EMPTY:
+                cost = COST[kind.name]
+                self.blit_text(f"${cost}", rect.right-10, rect.y+10, COL_SUB, align_right=True)
+
+        # tips
         tips = [
             "Left-click to build.",
             "Right-click to bulldoze.",
-            "Houses need a road and power.",
-            "Power is global but capped.",
-            "Factories earn money, hurt happiness.",
+            "Houses need a road + power.",
+            "Factories earn $, hurt happiness.",
             "Farms make food.",
         ]
-        self.canvas.create_text(x0+12, tip_y, anchor="nw", fill="#9e9e9e",
-                                text="\n".join(tips))
+        ty = HUD_H + 18 + len(self.buttons)*56 + 6
+        for t in tips:
+            self.blit_text(t, x0+16, ty, (155,155,155))
+            ty += 20
 
-    def draw_cursor_hint(self):
-        # Optional: highlight tile under cursor
-        pass
+    def draw_flash(self):
+        if self.game.flash_msg and self.game.flash_timer > 0:
+            msg = self.game.flash_msg
+            surf = self.font_big.render(msg, True, (255,255,255))
+            pad = 10
+            rect = surf.get_rect()
+            bx = 12
+            by = 12 + 26
+            back = pg.Rect(bx-8, by-4, rect.w+pad*2, rect.h+pad)
+            pg.draw.rect(self.screen, (0,0,0,120), back)
+            self.screen.blit(surf, (bx, by))
 
-    # ----- Input -----
-    def screen_to_grid(self, sx: int, sy: int) -> Optional[Tuple[int,int]]:
-        if sy < HUD_H: return None
-        if sx >= GRID_W * TILE: return None
-        gx = sx // TILE
-        gy = (sy - HUD_H) // TILE
+    # --------------- Interaction ---------------
+    def grid_from_mouse(self, pos: Tuple[int,int]) -> Optional[Tuple[int,int]]:
+        mx, my = pos
+        if my < HUD_H: return None
+        if mx >= GRID_W * TILE: return None
+        gx = mx // TILE
+        gy = (my - HUD_H) // TILE
         if 0 <= gx < GRID_W and 0 <= gy < GRID_H:
             return gx, gy
         return None
@@ -334,97 +335,40 @@ class App:
         g = self.game
         current = g.grid[y][x].kind
         if kind == B.EMPTY:
-            # Bulldoze refund 50% (rounded down), except road 30%
-            refund = 0
             if current != B.EMPTY:
                 base = COST[current.name]
-                if current == B.ROAD:
-                    refund = base // 3
-                else:
-                    refund = base // 2
+                refund = base//3 if current == B.ROAD else base//2
                 g.money += refund
                 g.grid[y][x].kind = B.EMPTY
             return
-
         if current != B.EMPTY:
-            return  # occupied
-
+            return
         price = COST[kind.name]
         if g.money < price:
+            g.set_flash("Not enough money", 1.2)
             return
-        # Adjacency rule for house: must touch a road to place (soft gate)
-        if kind == B.HOUSE and not g.adjacent_to_road(x, y):
-            # allow placement, but discourage with extra cost? Keep simple: allow but won't be occupied until road exists.
-            pass
-
+        # allow placing house off-road, but will be unoccupied until connected.
         g.money -= price
         g.grid[y][x].kind = kind
 
-    def on_left_click(self, ev):
-        pos = self.screen_to_grid(ev.x, ev.y)
-        if not pos: return
-        x, y = pos
-        kind = TOOLS[self.game.tool_index]
-        self.place(x, y, kind)
-        self.draw_all()
-
-    def on_right_click(self, ev):
-        pos = self.screen_to_grid(ev.x, ev.y)
-        if not pos: return
-        x, y = pos
-        self.place(x, y, B.EMPTY)
-        self.draw_all()
-
-    def on_key(self, ev):
-        key = ev.keysym.lower()
-        if key in ("1","2","3","4","5","6"):
-            self.game.tool_index = int(key)-1
-        elif key == "escape":
-            self.game.tool_index = len(TOOLS)-1  # bulldoze
-        elif key == "s":
-            self.save_dialog()
-        elif key == "l":
-            self.load_dialog()
-        elif key == "r":
-            if messagebox.askyesno("Reset", "Start a new city?"):
-                self.game = Game()
-        self.draw_all()
-
-    # ----- Save/Load -----
-    def save_dialog(self):
-        path = filedialog.asksaveasfilename(
-            title="Save City",
-            defaultextension=".json",
-            filetypes=[("JSON","*.json")],
-            initialfile="city_save.json",
-        )
-        if not path: return
-        self.save_to(path)
-
-    def save_to(self, path: str):
+    def quick_save(self):
         data = {
             "money": self.game.money,
             "food": self.game.food,
             "happiness": self.game.happiness,
-            "grid": [[tile.kind.name for tile in row] for row in self.game.grid],
             "tick": self.game.tick_count,
+            "grid": [[tile.kind.name for tile in row] for row in self.game.grid],
         }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        messagebox.showinfo("Saved", f"Saved to {path}")
-
-    def load_dialog(self):
-        path = filedialog.askopenfilename(
-            title="Load City",
-            filetypes=[("JSON","*.json")],
-            initialfile="city_save.json",
-        )
-        if not path: return
-        self.load_from(path)
-
-    def load_from(self, path: str):
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            self.game.set_flash(f"Saved to {SAVE_PATH}")
+        except Exception as e:
+            self.game.set_flash(f"Save failed: {e}")
+
+    def quick_load(self):
+        try:
+            with open(SAVE_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
             g = Game()
             g.money = int(data.get("money", 200))
@@ -441,29 +385,83 @@ class App:
                         except Exception:
                             g.grid[y][x].kind = B.EMPTY
             self.game = g
-            messagebox.showinfo("Loaded", f"Loaded from {path}")
+            self.game.set_flash(f"Loaded from {SAVE_PATH}")
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to load: {e}")
+            self.game.set_flash(f"Load failed: {e}")
 
-    # ----- Simulation loop -----
-    def schedule_tick(self):
-        if not self.game.running:
-            return
-        self.root.after(TICK_MS, self.step)
+    def handle_mouse(self, event):
+        if event.type == pg.MOUSEBUTTONDOWN:
+            if event.button == 1:  # left
+                # sidebar buttons
+                for rect, label, kind in self.buttons:
+                    if rect.collidepoint(event.pos):
+                        self.game.tool_index = TOOLS.index(kind)
+                        return
+                # grid placement
+                cell = self.grid_from_mouse(event.pos)
+                if cell:
+                    x,y = cell
+                    kind = TOOLS[self.game.tool_index]
+                    self.place(x,y,kind)
+            elif event.button == 3:  # right: bulldoze
+                cell = self.grid_from_mouse(event.pos)
+                if cell:
+                    x,y = cell
+                    self.place(x,y,B.EMPTY)
 
-    def step(self):
-        self.game.tick()
-        self.draw_all()
-        self.schedule_tick()
+    def handle_keys(self, event):
+        if event.type == pg.KEYDOWN:
+            k = event.key
+            if k in (pg.K_1,pg.K_2,pg.K_3,pg.K_4,pg.K_5,pg.K_6):
+                self.game.tool_index = {pg.K_1:0,pg.K_2:1,pg.K_3:2,pg.K_4:3,pg.K_5:4,pg.K_6:5}[k]
+            elif k == pg.K_ESCAPE:
+                self.game.tool_index = len(TOOLS)-1
+            elif k == pg.K_s:
+                self.quick_save()
+            elif k == pg.K_l:
+                self.quick_load()
+            elif k == pg.K_r:
+                self.game = Game()
+                self.game.set_flash("New city")
 
-# -------------------------
-# Main
-# -------------------------
+    # --------------- Main Loop ---------------
+    def run(self):
+        while self.running:
+            dt_ms = self.clock.tick(FPS)
+            for event in pg.event.get():
+                if event.type == pg.QUIT:
+                    self.running = False
+                self.handle_mouse(event)
+                self.handle_keys(event)
+
+            # sim tick
+            self.game.tick_ms_accum += dt_ms
+            if self.game.tick_ms_accum >= TICK_MS:
+                self.game.tick_ms_accum %= TICK_MS
+                self.game.tick()
+
+            # flash timer
+            if self.game.flash_timer > 0:
+                self.game.flash_timer -= dt_ms/1000.0
+                if self.game.flash_timer <= 0:
+                    self.game.flash_msg = None
+
+            self.draw()
+        pg.quit()
+
+    # helpers
+    def blit_text(self, text: str, x: int, y: int, color=(255,255,255), font=None, align_right=False):
+        font = font or self.font
+        surf = font.render(text, True, color)
+        rect = surf.get_rect()
+        if align_right:
+            self.screen.blit(surf, (x-rect.w, y))
+        else:
+            self.screen.blit(surf, (x, y))
+
+
 def main():
-    root = tk.Tk()
-    app = App(root)
-    root.resizable(False, False)
-    root.mainloop()
+    App().run()
 
 if __name__ == "__main__":
     main()
