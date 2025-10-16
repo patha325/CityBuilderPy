@@ -279,11 +279,17 @@ HOUSE=1; FARM=2; FACTORY=3; POWERPLANT=4; ROAD=9
 # - Power plants generate capacity (power_gen).
 # - Consumers (e.g., houses/factories) use power (power_use).
 # - Farms don't require power in this simple model.
+
+# Food model:
+# - Roads transmit food.
+# - Farms generate capacity (food_gen).
+# - Consumers (e.g., houses) use food (food_use).
+
 BUILDINGS = {
-    HOUSE:   {"name":"House",   "color":(0.95,0.55,0.55), "cost":10,  "income":1,  "power_use":1},
-    FARM:    {"name":"Farm",    "color":(0.55,0.95,0.55), "cost":15,  "income":2,  "power_use":0},
-    FACTORY: {"name":"Factory", "color":(0.55,0.65,0.95), "cost":30,  "income":5,  "power_use":2},
-    POWERPLANT: {"name":"Power plant", "color":(0.55,0.95,0.95), "cost":40,  "income":50, "power_gen":20},
+    HOUSE:   {"name":"House",   "color":(0.95,0.55,0.55), "cost":10,  "income":1,  "power_use":1,  "food_use":1},
+    FARM:    {"name":"Farm",    "color":(0.55,0.95,0.55), "cost":15,  "income":2,  "power_use":0,  "food_use":1},
+    FACTORY: {"name":"Factory", "color":(0.55,0.65,0.95), "cost":30,  "income":5,  "power_use":2,  "food_gen":20},
+    POWERPLANT: {"name":"Power plant", "color":(0.55,0.95,0.95), "cost":40,  "income":50, "power_gen":20,  "food_use":0},
 }
 ROAD_COLOR = (0.25,0.25,0.25)
 ADJ_BONUS_PER_ROAD_FOR_HOUSE = 1  # N/E/S/W only
@@ -294,11 +300,93 @@ def neighbors4(i,k,N):
         if 0 <= ni < N and 0 <= nk < N:
             yield ni, nk
 
+#An attempt to generalize needs based on electricity.
+class Need:
+    def __init__(self, name = POWERPLANT, generation = "power_gen", usage = "power_use"):
+        self.name = name
+        self.generation = generation
+        self.usage = usage
+        # Power state
+        self._need_dirty = True
+        self.needFulfilled = np.zeros((self.N, self.N), dtype=bool)  # which buildings are powered (consumers only)
+        self.need_supply = 0   # total capacity from plants
+        self.need_demand = 0   # total requested by connected consumers
+        self.need_used = 0     # how much capacity allocated    
+
+    def compute_need(self, city):
+        # Recompute power graph and allocation if dirty
+        if not (city._roads_dirty or city._bldg_dirty or self._need_dirty):
+            return
+        N = city.N
+        self.needFulfilled[:,:] = False
+        # Capacity from plants
+        plants = list(zip(*np.where(self.grid == self.name)))
+        supply = 0
+        for (pi, pk) in plants:
+            props = BUILDINGS.get(self.name, {})
+            supply += int(props.get(self.generation, 0))
+        self.power_supply = supply
+
+        # Find energized road network via multi-source BFS seeded by roads adjacent to plants
+        road_mask = (city.grid == ROAD)
+        energized = np.zeros_like(road_mask, dtype=bool)
+        from collections import deque
+        q = deque()
+        for (pi, pk) in plants:
+            for ni, nk in neighbors4(pi, pk, N):
+                if road_mask[ni, nk] and not energized[ni, nk]:
+                    energized[ni, nk] = True
+                    q.append((ni, nk))
+        while q:
+            ci, ck = q.popleft()
+            for ni, nk in neighbors4(ci, ck, N):
+                if road_mask[ni, nk] and not energized[ni, nk]:
+                    energized[ni, nk] = True
+                    q.append((ni, nk))
+
+        # Collect consumers connected to energized roads or directly adjacent to plants
+        consumers = []  # list of (i,k,power_use)
+        total_demand = 0
+        for i in range(N):
+            for k in range(N):
+                t = int(city.grid[i,k])
+                if t in (0, ROAD):
+                    continue
+                p_use = int(BUILDINGS[t].get(self.usage, 0))
+                if p_use <= 0:
+                    continue
+                # Connected if adjacent to energized road or directly adjacent to plant
+                connected = False
+                for ni, nk in neighbors4(i, k, N):
+                    if energized[ni, nk] or city.grid[ni, nk] == self.name:
+                        connected = True
+                        break
+                if connected:
+                    consumers.append((i, k, p_use))
+                    total_demand += p_use
+        self.need_demand = total_demand
+
+        # Allocate capacity in a stable order (top-left to bottom-right)
+        consumers.sort(key=lambda x: (x[0], x[1]))
+        remaining = self.need_supply
+        used = 0
+        for i, k, p_use in consumers:
+            if remaining >= p_use:
+                self.needFulfilled[i, k] = True
+                remaining -= p_use
+                used += p_use
+            else:
+                self.needFulfilled[i, k] = False
+        self.need_used = used
+        self._need_dirty = False    
+
+
 class City:
     def __init__(self, size):
         self.N = size
         self.grid = np.zeros((self.N, self.N), dtype=np.int8)
         self.money = 5000
+        self.current_income = 0
         self.selected = HOUSE
         self.last_income = time.perf_counter()
         self._roads_dirty = True
@@ -324,6 +412,7 @@ class City:
         if kind == ROAD: self._roads_dirty = True
         else: self._bldg_dirty = True
         self._power_dirty = True
+        self._food_dirty = True
         return True
     def remove(self, i, k):
         if not (0 <= i < self.N and 0 <= k < self.N): return False
@@ -402,6 +491,7 @@ class City:
                 self.powered[i, k] = False
         self.power_used = used
         self._power_dirty = False
+
     def income_tick(self):
         now = time.perf_counter()
         if now - self.last_income < 1.0: return 0
@@ -431,6 +521,7 @@ class City:
                             bonus += ADJ_BONUS_PER_ROAD_FOR_HOUSE
         income += bonus
         self.money += income
+        self.current_income = income
         return income
     # Instance data builders
     def build_instanced_arrays(self):
@@ -459,6 +550,16 @@ class City:
             if not offs: return np.zeros((0,6), np.float32)
             return np.concatenate([np.asarray(offs,np.float32), np.asarray(cols,np.float32)], axis=1)
         return pack(bldg_offsets,bldg_colors), pack(road_offsets,road_colors)
+
+    def refresh_instances(self, inst_buildings, inst_roads, force=False):
+        if self._bldg_dirty or force:
+            oc_bldg, _ = self.build_instanced_arrays()
+            inst_buildings.upload(oc_bldg)
+            self._bldg_dirty = False
+        if self._roads_dirty or force:
+            _, oc_road = self.build_instanced_arrays()
+            inst_roads.upload(oc_road)
+            self._roads_dirty = False
 
     # Save/load
     def save_json(self, path):
@@ -651,20 +752,146 @@ def init_pygame(width=1280, height=720, title="City Builder Plus (OpenGL 3.3)"):
     pygame.display.set_caption(title)
     return screen
 
+
+def draw_helper(count, cube, cube_count, u_model, model):
+    glUniformMatrix4fv(u_model, 1, GL_FALSE, model.T.astype(np.float32))
+    glBindVertexArray(cube)
+    if(count):
+        glDrawElementsInstanced(GL_TRIANGLES, cube_count, GL_UNSIGNED_INT, ctypes.c_void_p(0), count)
+
+def draw_hover(hover_tile, city, prog, u_model, cube_vao_buildings, cube_icount):
+    i, k = hover_tile
+    height = 0.1 if city.selected == ROAD else 1.0
+    yoff   = 0.05 if city.selected == ROAD else 0.5
+    model_preview = translation([i + 0.5, yoff, k + 0.5]) @ scale(1.001, height, 1.001)
+
+    glUseProgram(prog)  # <-- ensure the right program is current
+    glUniformMatrix4fv(u_model, 1, GL_FALSE, model_preview.T.astype(np.float32))
+    glBindVertexArray(cube_vao_buildings)
+
+    # Temporarily disable instanced attributes so we don't read from empty instance buffers
+    glDisableVertexAttribArray(2)  # iOffset
+    glDisableVertexAttribArray(3)  # iColor
+    # Provide constant "current values" for disabled attribs (shader multiplies by aColor anyway)
+    glVertexAttrib3f(2, 0.0, 0.0, 0.0)  # iOffset
+    glVertexAttrib3f(3, 1.0, 1.0, 0.0)  # iColor (yellow wireframe)
+
+    glEnable(GL_POLYGON_OFFSET_LINE); glPolygonOffset(-1.0, -1.0)
+    glPolygonMode(GL_FRONT_AND_BACK, GL_LINE)
+    glDrawElements(GL_TRIANGLES, cube_icount, GL_UNSIGNED_INT, ctypes.c_void_p(0))
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
+    glDisable(GL_POLYGON_OFFSET_LINE)
+
+    # Restore instanced attributes for later instanced draws
+    glEnableVertexAttribArray(2)
+    glEnableVertexAttribArray(3)
+    glBindVertexArray(0)
+
+def event_handle(city, hud, hud_lines, inst_buildings, inst_roads, screen, fovy, w, h, proj, znear, zfar, ubo, cam):
+    running = True
+    for ev in pygame.event.get():
+        if ev.type == QUIT:
+            running = False
+        elif ev.type == KEYDOWN:
+            if ev.key == K_ESCAPE:
+                running = False
+            elif ev.key == K_m:
+                mouse_captured = not mouse_captured
+                pygame.mouse.set_visible(not mouse_captured)
+                pygame.event.set_grab(mouse_captured)
+            elif ev.unicode in ('1','2','3','4'):
+                city.selected = int(ev.unicode)
+                hud.update_text(hud_lines)
+            elif ev.unicode.lower() == 'r':
+                city.selected = ROAD
+                hud.update_text(hud_lines)
+            elif ev.key == pygame.K_F5:
+                city.save_json("city.json"); print("Saved city.json"); hud.update_text(hud_lines)
+            elif ev.key == pygame.K_F6:
+                try:
+                    city.load_json("city.json"); city.refresh_instances(inst_buildings, inst_roads, force=True); print("Loaded city.json"); hud.update_text(hud_lines)
+                except Exception as e:
+                    print("Load JSON failed:", e)
+            elif ev.key == pygame.K_F9:
+                city.save_npz("city.npz"); print("Saved city.npz"); hud.update_text(hud_lines)
+            elif ev.key == pygame.K_F10:
+                try:
+                    city.load_npz("city.npz"); city.refresh_instances(inst_buildings, inst_roads, force=True); print("Loaded city.npz"); hud.update_text(hud_lines)
+                except Exception as e:
+                    print("Load NPZ failed:", e)
+        elif ev.type in (VIDEORESIZE, WINDOWSIZECHANGED):
+            w,h = screen.get_size()
+            glViewport(0,0,w,max(1,h))
+            proj = perspective(fovy, w/max(h,1), znear, zfar)
+            update_matrices_ubo(ubo, proj, cam.view())
+        elif ev.type == MOUSEBUTTONDOWN:
+            mx, my = pygame.mouse.get_pos()
+            origin, dirv = make_ray(mx, my, w, h, proj, cam.view())
+            hit = ray_plane_y0_intersect(origin, dirv)
+            if hit is not None:
+                i = int(math.floor(hit[0]))
+                k = int(math.floor(hit[2]))
+                if ev.button == 1:   # place
+                    if city.place(i,k):
+                        city.refresh_instances(inst_buildings, inst_roads)
+                        hud.update_text(hud_lines)
+                elif ev.button == 3: # remove
+                    if city.remove(i,k):
+                        city.refresh_instances(inst_buildings, inst_roads)
+                        hud.update_text(hud_lines)
+    return running
+
+#def draw_loop():
+
+def mouse_and_movement(cam, dt, mouse_captured, w, h, proj, GRID):
+    # Movement
+    keys = pygame.key.get_pressed()
+    move = np.zeros(3, np.float32)
+    speed = 8.0
+    if keys[K_w]: move += cam.front
+    if keys[K_s]: move -= cam.front
+    if keys[K_d]: move += cam.right
+    if keys[K_a]: move -= cam.right
+    if keys[K_SPACE]: move += cam.up
+    if keys[K_c]: move -= cam.up
+    if np.linalg.norm(move) > 0: cam.move(normalize(move), speed, dt)
+
+    # Mouse look
+    if mouse_captured:
+        dx, dy = pygame.mouse.get_rel()
+        cam.process_mouse(dx, dy, 0.15)
+    else:
+        pygame.mouse.get_rel()
+
+    # Hover tile computation
+    mx, my = pygame.mouse.get_pos()
+    origin, dirv = make_ray(mx, my, w, h, proj, cam.view())
+    hit = ray_plane_y0_intersect(origin, dirv)
+    hover_tile = None
+    if hit is not None:
+        i = int(math.floor(hit[0])); k = int(math.floor(hit[2]))
+        if 0 <= i < GRID and 0 <= k < GRID:
+            hover_tile = (i, k) 
+    return(hover_tile)  
+
+
+
 # -------------- Main --------------
 def main():
     GRID = 32
     city = City(GRID)
     pop = Population(city)
+    debug = False
 
     screen = init_pygame()
     w, h = screen.get_size()
     glViewport(0,0,w,h)
 
-    print("GL_VENDOR:  ", glGetString(GL_VENDOR).decode())
-    print("GL_RENDERER:", glGetString(GL_RENDERER).decode())
-    print("GL_VERSION: ", glGetString(GL_VERSION).decode())
-    print("GLSL:       ", glGetString(GL_SHADING_LANGUAGE_VERSION).decode())
+    if(debug):
+        print("GL_VENDOR:  ", glGetString(GL_VENDOR).decode())
+        print("GL_RENDERER:", glGetString(GL_RENDERER).decode())
+        print("GL_VERSION: ", glGetString(GL_VERSION).decode())
+        print("GLSL:       ", glGetString(GL_SHADING_LANGUAGE_VERSION).decode())
 
     glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LEQUAL)
 
@@ -672,8 +899,6 @@ def main():
     p_vs = compile_shader(VERT_SRC, GL_VERTEX_SHADER)
     p_fs = compile_shader(FRAG_SRC, GL_FRAGMENT_SHADER)
     prog = link_program(p_vs, p_fs)
-
-    
 
     # UBO binding
     ubo = create_matrices_ubo()
@@ -711,17 +936,7 @@ def main():
     pygame.mouse.set_visible(True)
     pygame.event.set_grab(False)
 
-    def refresh_instances(force=False):
-        if city._bldg_dirty or force:
-            oc_bldg, _ = city.build_instanced_arrays()
-            inst_buildings.upload(oc_bldg)
-            city._bldg_dirty = False
-        if city._roads_dirty or force:
-            _, oc_road = city.build_instanced_arrays()
-            inst_roads.upload(oc_road)
-            city._roads_dirty = False
-
-    refresh_instances(force=True)
+    city.refresh_instances(inst_buildings, inst_roads, force=True)
 
     clock = pygame.time.Clock()
     running = True
@@ -748,7 +963,7 @@ def main():
                     if city.powered[i, k]:
                         powered += 1
         return [
-            f"Money: {city.money}",
+            f"Money: {city.money} Income={city.current_income}",
             f"Selected [{sel}]: {name}",
             f"Counts: House={counts[HOUSE]} Farm={counts[FARM]} Factory={counts[FACTORY]} Power plant={counts[POWERPLANT]} Roads={counts[ROAD]}",
             f"Power: supply={city.power_supply} used={city.power_used} demand={city.power_demand} powered_buildings={powered}/{need_power}",
@@ -760,88 +975,13 @@ def main():
     # Start with HUD text
     hud.update_text(hud_lines())
 
+    # Game loop
     while running:
         dt = clock.tick(120) / 1000.0
 
-        for ev in pygame.event.get():
-            if ev.type == QUIT:
-                running = False
-            elif ev.type == KEYDOWN:
-                if ev.key == K_ESCAPE:
-                    running = False
-                elif ev.key == K_m:
-                    mouse_captured = not mouse_captured
-                    pygame.mouse.set_visible(not mouse_captured)
-                    pygame.event.set_grab(mouse_captured)
-                elif ev.unicode in ('1','2','3','4'):
-                    city.selected = int(ev.unicode)
-                    hud.update_text(hud_lines())
-                elif ev.unicode.lower() == 'r':
-                    city.selected = ROAD
-                    hud.update_text(hud_lines())
-                elif ev.key == pygame.K_F5:
-                    city.save_json("city.json"); print("Saved city.json"); hud.update_text(hud_lines())
-                elif ev.key == pygame.K_F6:
-                    try:
-                        city.load_json("city.json"); refresh_instances(force=True); print("Loaded city.json"); hud.update_text(hud_lines())
-                    except Exception as e:
-                        print("Load JSON failed:", e)
-                elif ev.key == pygame.K_F9:
-                    city.save_npz("city.npz"); print("Saved city.npz"); hud.update_text(hud_lines())
-                elif ev.key == pygame.K_F10:
-                    try:
-                        city.load_npz("city.npz"); refresh_instances(force=True); print("Loaded city.npz"); hud.update_text(hud_lines())
-                    except Exception as e:
-                        print("Load NPZ failed:", e)
-            elif ev.type in (VIDEORESIZE, WINDOWSIZECHANGED):
-                w,h = screen.get_size()
-                glViewport(0,0,w,max(1,h))
-                proj = perspective(fovy, w/max(h,1), znear, zfar)
-                update_matrices_ubo(ubo, proj, cam.view())
-            elif ev.type == MOUSEBUTTONDOWN:
-                mx, my = pygame.mouse.get_pos()
-                origin, dirv = make_ray(mx, my, w, h, proj, cam.view())
-                hit = ray_plane_y0_intersect(origin, dirv)
-                if hit is not None:
-                    i = int(math.floor(hit[0]))
-                    k = int(math.floor(hit[2]))
-                    if ev.button == 1:   # place
-                        if city.place(i,k):
-                            refresh_instances()
-                            hud.update_text(hud_lines())
-                    elif ev.button == 3: # remove
-                        if city.remove(i,k):
-                            refresh_instances()
-                            hud.update_text(hud_lines())
+        running = event_handle(city,hud,hud_lines(), inst_buildings, inst_roads, screen, fovy, w, h, proj, znear, zfar, ubo, cam)
+        hover_tile = mouse_and_movement(cam, dt, mouse_captured, w, h, proj, GRID)
 
-        # Movement
-        keys = pygame.key.get_pressed()
-        move = np.zeros(3, np.float32)
-        speed = 8.0
-        if keys[K_w]: move += cam.front
-        if keys[K_s]: move -= cam.front
-        if keys[K_d]: move += cam.right
-        if keys[K_a]: move -= cam.right
-        if keys[K_SPACE]: move += cam.up
-        if keys[K_c]: move -= cam.up
-        if np.linalg.norm(move) > 0: cam.move(normalize(move), speed, dt)
-
-        # Mouse look
-        if mouse_captured:
-            dx, dy = pygame.mouse.get_rel()
-            cam.process_mouse(dx, dy, 0.15)
-        else:
-            pygame.mouse.get_rel()
-
-        # Hover tile computation
-        mx, my = pygame.mouse.get_pos()
-        origin, dirv = make_ray(mx, my, w, h, proj, cam.view())
-        hit = ray_plane_y0_intersect(origin, dirv)
-        hover_tile = None
-        if hit is not None:
-            i = int(math.floor(hit[0])); k = int(math.floor(hit[2]))
-            if 0 <= i < GRID and 0 <= k < GRID:
-                hover_tile = (i, k)
         # Economy + population
         income = city.income_tick()
         pop.update(dt)
@@ -855,60 +995,30 @@ def main():
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
         glUseProgram(prog)
+
         # Ground
         glUniformMatrix4fv(u_model, 1, GL_FALSE, ground_model.T.astype(np.float32))
         glBindVertexArray(ground_vao)
         glDrawElements(GL_TRIANGLES, ground_icount, GL_UNSIGNED_INT, ctypes.c_void_p(0))
-        glBindVertexArray(0)
+
         # Roads (thin: scale Y)
-        glBindVertexArray(cube_vao_roads)
         model_roads = scale(1.0, 0.1, 1.0)  # thin slabs centered at i+0.5, y slightly above ground (set in offsets)
-        glUniformMatrix4fv(u_model, 1, GL_FALSE, model_roads.T.astype(np.float32))
-        if inst_roads.count > 0:
-            glDrawElementsInstanced(GL_TRIANGLES, cube_icount, GL_UNSIGNED_INT, ctypes.c_void_p(0), inst_roads.count)
+        draw_helper(inst_roads.count, cube_vao_roads, cube_icount, u_model, model_roads)
+        
         # Buildings (full height)
         model_b = scale(1.0, 1.0, 1.0)
-        glUniformMatrix4fv(u_model, 1, GL_FALSE, model_b.T.astype(np.float32))
-        glBindVertexArray(cube_vao_buildings)
-        if inst_buildings.count > 0:
-            glDrawElementsInstanced(GL_TRIANGLES, cube_icount, GL_UNSIGNED_INT, ctypes.c_void_p(0), inst_buildings.count)
+        draw_helper(inst_buildings.count, cube_vao_buildings, cube_icount, u_model, model_b)
+        
         # Citizens (tiny cubes)
         model_p = scale(0.25, 0.25, 0.25)
-        glUniformMatrix4fv(u_model, 1, GL_FALSE, model_p.T.astype(np.float32))
-        glBindVertexArray(cube_vao_people)
-        if inst_people.count > 0:
-            glDrawElementsInstanced(GL_TRIANGLES, cube_icount, GL_UNSIGNED_INT, ctypes.c_void_p(0), inst_people.count)
+        draw_helper(inst_people.count, cube_vao_people, cube_icount, u_model, model_p)
 
         glBindVertexArray(0)
-        # Wireframe hover cube (preview)
-        if hover_tile is not None:
-            i, k = hover_tile
-            height = 0.1 if city.selected == ROAD else 1.0
-            yoff   = 0.05 if city.selected == ROAD else 0.5
-            model_preview = translation([i + 0.5, yoff, k + 0.5]) @ scale(1.001, height, 1.001)
-
-            glUseProgram(prog)  # <-- ensure the right program is current
-            glUniformMatrix4fv(u_model, 1, GL_FALSE, model_preview.T.astype(np.float32))
-            glBindVertexArray(cube_vao_buildings)
-
-            # Temporarily disable instanced attributes so we don't read from empty instance buffers
-            glDisableVertexAttribArray(2)  # iOffset
-            glDisableVertexAttribArray(3)  # iColor
-            # Provide constant "current values" for disabled attribs (shader multiplies by aColor anyway)
-            glVertexAttrib3f(2, 0.0, 0.0, 0.0)  # iOffset
-            glVertexAttrib3f(3, 1.0, 1.0, 0.0)  # iColor (yellow wireframe)
-
-            glEnable(GL_POLYGON_OFFSET_LINE); glPolygonOffset(-1.0, -1.0)
-            glPolygonMode(GL_FRONT_AND_BACK, GL_LINE)
-            glDrawElements(GL_TRIANGLES, cube_icount, GL_UNSIGNED_INT, ctypes.c_void_p(0))
-            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
-            glDisable(GL_POLYGON_OFFSET_LINE)
-
-            # Restore instanced attributes for later instanced draws
-            glEnableVertexAttribArray(2)
-            glEnableVertexAttribArray(3)
-            glBindVertexArray(0)
         
+        # Wireframe hover cube (preview)
+        if hover_tile:
+            draw_hover(hover_tile, city, prog, u_model, cube_vao_buildings, cube_icount)
+
         hud.draw(hud_lines())
 
         pygame.display.flip()
