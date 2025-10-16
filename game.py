@@ -597,6 +597,11 @@ class HUD:
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
         glBindTexture(GL_TEXTURE_2D, 0)
         self.last_text = ""
+        self.hud_vao, self.hud_icount = make_hud_quad()
+        hud_vs = compile_shader(HUD_VERT, GL_VERTEX_SHADER)
+        hud_fs = compile_shader(HUD_FRAG, GL_FRAGMENT_SHADER)
+        self.hud_prog = link_program(hud_vs, hud_fs)
+        
     def update_text(self, lines):
         text = "\n".join(lines)
         if text == self.last_text:
@@ -614,6 +619,22 @@ class HUD:
         glBindTexture(GL_TEXTURE_2D, self.tex)
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, self.w, self.h, GL_RGBA, GL_UNSIGNED_BYTE, data)
         glBindTexture(GL_TEXTURE_2D, 0)
+
+    def draw(self, lines):
+        # HUD draw
+        self.update_text(lines)
+        glDisable(GL_DEPTH_TEST)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glUseProgram(self.hud_prog)
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, self.tex)
+        glBindVertexArray(self.hud_vao)
+        glDrawElements(GL_TRIANGLES, self.hud_icount, GL_UNSIGNED_INT, ctypes.c_void_p(0))
+        glBindVertexArray(0)
+        glBindTexture(GL_TEXTURE_2D, 0)
+        glUseProgram(0)
+        glDisable(GL_BLEND)
+        glEnable(GL_DEPTH_TEST)
 
 # -------------- Pygame / GL init --------------
 def init_pygame(width=1280, height=720, title="City Builder Plus (OpenGL 3.3)"):
@@ -651,9 +672,8 @@ def main():
     p_vs = compile_shader(VERT_SRC, GL_VERTEX_SHADER)
     p_fs = compile_shader(FRAG_SRC, GL_FRAGMENT_SHADER)
     prog = link_program(p_vs, p_fs)
-    hud_vs = compile_shader(HUD_VERT, GL_VERTEX_SHADER)
-    hud_fs = compile_shader(HUD_FRAG, GL_FRAGMENT_SHADER)
-    hud_prog = link_program(hud_vs, hud_fs)
+
+    
 
     # UBO binding
     ubo = create_matrices_ubo()
@@ -666,7 +686,7 @@ def main():
     cube_vao_roads, _ = make_cube()
     cube_vao_people, _ = make_cube()
     ground_vao, ground_icount = make_ground()
-    hud_vao, hud_icount = make_hud_quad()
+    
     inst_buildings = InstanceBuffer(cube_vao_buildings)
     inst_roads     = InstanceBuffer(cube_vao_roads)
     inst_people    = InstanceBuffer(cube_vao_people)  # tiny cubes
@@ -889,20 +909,7 @@ def main():
             glEnableVertexAttribArray(3)
             glBindVertexArray(0)
         
-        # HUD draw
-        hud.update_text(hud_lines())
-        glDisable(GL_DEPTH_TEST)
-        glEnable(GL_BLEND)
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-        glUseProgram(hud_prog)
-        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, hud.tex)
-        glBindVertexArray(hud_vao)
-        glDrawElements(GL_TRIANGLES, hud_icount, GL_UNSIGNED_INT, ctypes.c_void_p(0))
-        glBindVertexArray(0)
-        glBindTexture(GL_TEXTURE_2D, 0)
-        glUseProgram(0)
-        glDisable(GL_BLEND)
-        glEnable(GL_DEPTH_TEST)
+        hud.draw(hud_lines())
 
         pygame.display.flip()
     pygame.quit()
