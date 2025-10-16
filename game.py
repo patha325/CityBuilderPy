@@ -181,8 +181,8 @@ def make_hud_quad():
         #   x,   y,   u,   v
         -1.0,  1.0,  0.0, 0.0,
         -1.0,  0.6,  0.0, 1.0,
-        -0.2,  0.6,  1.0, 1.0,
-        -0.2,  1.0,  1.0, 0.0,
+        +1.0,  0.6,  1.0, 1.0,
+        +1.0,  1.0,  1.0, 0.0,
     ], dtype=np.float32)
     idx = np.array([0,1,2, 2,3,0], dtype=np.uint32)
     vao = glGenVertexArrays(1); glBindVertexArray(vao)
@@ -272,12 +272,13 @@ def ray_plane_y0_intersect(o, d):
 
 # -------------- Game data --------------
 # Building IDs
-HOUSE=1; FARM=2; FACTORY=3; ROAD=9
+HOUSE=1; FARM=2; FACTORY=3; POWERPLANT=4; ROAD=9
 
 BUILDINGS = {
     HOUSE:   {"name":"House",   "color":(0.95,0.55,0.55), "cost":10,  "income":1},
     FARM:    {"name":"Farm",    "color":(0.55,0.95,0.55), "cost":15,  "income":2},
     FACTORY: {"name":"Factory", "color":(0.55,0.65,0.95), "cost":30,  "income":5},
+    POWERPLANT: {"name":"Power plant", "color":(0.55,0.95,0.95), "cost":40,  "income":50},
 }
 ROAD_COLOR = (0.25,0.25,0.25)
 ADJ_BONUS_PER_ROAD_FOR_HOUSE = 1  # N/E/S/W only
@@ -292,7 +293,7 @@ class City:
     def __init__(self, size):
         self.N = size
         self.grid = np.zeros((self.N, self.N), dtype=np.int8)
-        self.money = 50
+        self.money = 5000
         self.selected = HOUSE
         self.last_income = time.perf_counter()
         self._roads_dirty = True
@@ -439,35 +440,39 @@ class Population:
         self.city = city
         self.citizens = []  # list of Citizen
         self._cooldown = 0.0
-        def update(self, dt):
-            # spawn at most 1 per second if possible
-            self._cooldown -= dt
-            if self._cooldown <= 0.0:
-                self._cooldown = 1.0
-                # try to create a commuter from a random house to a random factory via roads
-                houses = list(zip(*np.where(self.city.grid == HOUSE)))
-                facts  = list(zip(*np.where(self.city.grid == FACTORY)))
-                if houses and facts:
-                    h = random.choice(houses); f = random.choice(facts)
-                    # find nearest road to each (or require they sit on road neighbors)
-                    def nearest_road(tile):
-                        i,k = tile
-                        best=None; bestd=1e9
-                        for ri,rk in zip(*np.where(self.city.grid == ROAD)):
-                            d = abs(ri-i)+abs(rk-k)
-                            if d < bestd: bestd, best=(d,(ri,rk))
-                        return best[1] if best else None
-                    rs = nearest_road(h); rg = nearest_road(f)
-                    if rs and rg:
-                        path = a_star(self.city.grid, rs, rg)
-                        if path:
-                            self.citizens.append(Citizen(rs, path))
-            # move all
-            for c in self.citizens:
-                c.update(dt)
-            # cap population
-            if len(self.citizens) > 200:
-                self.citizens = self.citizens[-200:]
+    def update(self, dt):
+        # spawn at most 1 per second if possible
+        self._cooldown -= dt
+        if self._cooldown <= 0.0:
+            self._cooldown = 1.0
+            # try to create a commuter from a random house to a random factory via roads
+            houses = list(zip(*np.where(self.city.grid == HOUSE)))
+            facts  = list(zip(*np.where(self.city.grid == FACTORY)))
+            if houses and facts:
+                h = random.choice(houses); f = random.choice(facts)
+                # find nearest road to each (or require they sit on road neighbors)
+                def nearest_road(tile):
+                    i,k = tile
+                    best=None; bestd=1e9
+                    for ri,rk in zip(*np.where(self.city.grid == ROAD)):
+                        d = abs(ri-i)+abs(rk-k)
+                        if d < bestd: bestd, best=(d,(ri,rk))
+                    if best:
+                        return best
+                    else:
+                        return None
+                
+                rs = nearest_road(h); rg = nearest_road(f)
+                if rs and rg:
+                    path = a_star(self.city.grid, rs, rg)
+                    if path:
+                        self.citizens.append(Citizen(rs, path))
+        # move all
+        for c in self.citizens:
+            c.update(dt)
+        # cap population
+        if len(self.citizens) > 200:
+            self.citizens = self.citizens[-200:]
 
     def instanced_data(self):
         if not self.citizens:
@@ -483,7 +488,7 @@ class HUD:
         # Prefer a robust monospace fallback list
         self.font = pygame.font.SysFont(["Consolas", "Menlo", "DejaVu Sans Mono", "Monospace"], 18)
         self.tex = glGenTextures(1)
-        self.w = 640; self.h = 256  # HUD texture size
+        self.w = w; self.h = h  # HUD texture size
         glBindTexture(GL_TEXTURE_2D, self.tex)
         # Ensure tight byte packing from pygame surfaces
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
@@ -529,7 +534,7 @@ def init_pygame(width=1280, height=720, title="City Builder Plus (OpenGL 3.3)"):
 def main():
     GRID = 32
     city = City(GRID)
-    #pop = Population(city)
+    pop = Population(city)
 
     screen = init_pygame()
     w, h = screen.get_size()
@@ -579,7 +584,7 @@ def main():
     ground_model = translation([GRID/2.0, 0.0, GRID/2.0]) @ scale(GRID/2.0, 1.0, GRID/2.0)
 
     # HUD
-    hud = HUD(w,h)
+    hud = HUD(w,h/4) #Resonable size (Check UV map) in make_hud_quad():
 
     # State
     mouse_captured = False
@@ -608,11 +613,12 @@ def main():
         counts = {HOUSE:int(np.sum(city.grid==HOUSE)),
                   FARM:int(np.sum(city.grid==FARM)),
                   FACTORY:int(np.sum(city.grid==FACTORY)),
+                  POWERPLANT:int(np.sum(city.grid==POWERPLANT)),
                   ROAD:int(np.sum(city.grid==ROAD))}
         return [
             f"Money: {city.money}",
             f"Selected [{sel}]: {name}",
-            f"Counts: House={counts[HOUSE]} Farm={counts[FARM]} Factory={counts[FACTORY]} Roads={counts[ROAD]}",
+            f"Counts: House={counts[HOUSE]} Farm={counts[FARM]} Factory={counts[FACTORY]} Power plant={counts[POWERPLANT]} Roads={counts[ROAD]}",
             "Controls: 1/2/3=House/Farm/Factory, R=Road tool, LMB place, RMB remove",
             "           M toggle mouse capture, WASD/Space/C move, F5/F6 JSON save/load, F9/F10 NPZ",
             "Adjacency: Houses +1 income per adjacent road (N/E/S/W). Citizens use roads."
@@ -634,7 +640,7 @@ def main():
                     mouse_captured = not mouse_captured
                     pygame.mouse.set_visible(not mouse_captured)
                     pygame.event.set_grab(mouse_captured)
-                elif ev.unicode in ('1','2','3'):
+                elif ev.unicode in ('1','2','3','4'):
                     city.selected = int(ev.unicode)
                     hud.update_text(hud_lines())
                 elif ev.unicode.lower() == 'r':
@@ -705,8 +711,8 @@ def main():
                 hover_tile = (i, k)
         # Economy + population
         income = city.income_tick()
-        #pop.update(dt)
-        #inst_people.upload(pop.instanced_data())
+        pop.update(dt)
+        inst_people.upload(pop.instanced_data())
 
         # Update UBO
         update_matrices_ubo(ubo, proj, cam.view())
