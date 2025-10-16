@@ -274,11 +274,16 @@ def ray_plane_y0_intersect(o, d):
 # Building IDs
 HOUSE=1; FARM=2; FACTORY=3; POWERPLANT=4; ROAD=9
 
+# Power model:
+# - Roads transmit power.
+# - Power plants generate capacity (power_gen).
+# - Consumers (e.g., houses/factories) use power (power_use).
+# - Farms don't require power in this simple model.
 BUILDINGS = {
-    HOUSE:   {"name":"House",   "color":(0.95,0.55,0.55), "cost":10,  "income":1},
-    FARM:    {"name":"Farm",    "color":(0.55,0.95,0.55), "cost":15,  "income":2},
-    FACTORY: {"name":"Factory", "color":(0.55,0.65,0.95), "cost":30,  "income":5},
-    POWERPLANT: {"name":"Power plant", "color":(0.55,0.95,0.95), "cost":40,  "income":50},
+    HOUSE:   {"name":"House",   "color":(0.95,0.55,0.55), "cost":10,  "income":1,  "power_use":1},
+    FARM:    {"name":"Farm",    "color":(0.55,0.95,0.55), "cost":15,  "income":2,  "power_use":0},
+    FACTORY: {"name":"Factory", "color":(0.55,0.65,0.95), "cost":30,  "income":5,  "power_use":2},
+    POWERPLANT: {"name":"Power plant", "color":(0.55,0.95,0.95), "cost":40,  "income":50, "power_gen":20},
 }
 ROAD_COLOR = (0.25,0.25,0.25)
 ADJ_BONUS_PER_ROAD_FOR_HOUSE = 1  # N/E/S/W only
@@ -298,6 +303,12 @@ class City:
         self.last_income = time.perf_counter()
         self._roads_dirty = True
         self._bldg_dirty = True
+        # Power state
+        self._power_dirty = True
+        self.powered = np.zeros((self.N, self.N), dtype=bool)  # which buildings are powered (consumers only)
+        self.power_supply = 0   # total capacity from plants
+        self.power_demand = 0   # total requested by connected consumers
+        self.power_used = 0     # how much capacity allocated
     def can_place(self, i, k, kind):
         if not (0 <= i < self.N and 0 <= k < self.N): return False
         if kind == ROAD:
@@ -312,6 +323,7 @@ class City:
         self.grid[i,k] = kind
         if kind == ROAD: self._roads_dirty = True
         else: self._bldg_dirty = True
+        self._power_dirty = True
         return True
     def remove(self, i, k):
         if not (0 <= i < self.N and 0 <= k < self.N): return False
@@ -322,28 +334,108 @@ class City:
         self.grid[i,k] = 0
         if cur == ROAD: self._roads_dirty = True
         else: self._bldg_dirty = True
+        self._power_dirty = True
         return True
+    def compute_power(self):
+        # Recompute power graph and allocation if dirty
+        if not (self._roads_dirty or self._bldg_dirty or self._power_dirty):
+            return
+        N = self.N
+        self.powered[:,:] = False
+        # Capacity from plants
+        plants = list(zip(*np.where(self.grid == POWERPLANT)))
+        supply = 0
+        for (pi, pk) in plants:
+            props = BUILDINGS.get(POWERPLANT, {})
+            supply += int(props.get("power_gen", 0))
+        self.power_supply = supply
+
+        # Find energized road network via multi-source BFS seeded by roads adjacent to plants
+        road_mask = (self.grid == ROAD)
+        energized = np.zeros_like(road_mask, dtype=bool)
+        from collections import deque
+        q = deque()
+        for (pi, pk) in plants:
+            for ni, nk in neighbors4(pi, pk, N):
+                if road_mask[ni, nk] and not energized[ni, nk]:
+                    energized[ni, nk] = True
+                    q.append((ni, nk))
+        while q:
+            ci, ck = q.popleft()
+            for ni, nk in neighbors4(ci, ck, N):
+                if road_mask[ni, nk] and not energized[ni, nk]:
+                    energized[ni, nk] = True
+                    q.append((ni, nk))
+
+        # Collect consumers connected to energized roads or directly adjacent to plants
+        consumers = []  # list of (i,k,power_use)
+        total_demand = 0
+        for i in range(N):
+            for k in range(N):
+                t = int(self.grid[i,k])
+                if t in (0, ROAD):
+                    continue
+                p_use = int(BUILDINGS[t].get("power_use", 0))
+                if p_use <= 0:
+                    continue
+                # Connected if adjacent to energized road or directly adjacent to plant
+                connected = False
+                for ni, nk in neighbors4(i, k, N):
+                    if energized[ni, nk] or self.grid[ni, nk] == POWERPLANT:
+                        connected = True
+                        break
+                if connected:
+                    consumers.append((i, k, p_use))
+                    total_demand += p_use
+        self.power_demand = total_demand
+
+        # Allocate capacity in a stable order (top-left to bottom-right)
+        consumers.sort(key=lambda x: (x[0], x[1]))
+        remaining = self.power_supply
+        used = 0
+        for i, k, p_use in consumers:
+            if remaining >= p_use:
+                self.powered[i, k] = True
+                remaining -= p_use
+                used += p_use
+            else:
+                self.powered[i, k] = False
+        self.power_used = used
+        self._power_dirty = False
     def income_tick(self):
         now = time.perf_counter()
         if now - self.last_income < 1.0: return 0
         self.last_income = now
+        # Ensure power state is up to date for income gating
+        self.compute_power()
         income = 0
-        # base income
-        for kind, props in BUILDINGS.items():
-            count = int(np.sum(self.grid == kind))
-            income += count * props["income"]
-        # road adjacency bonus for houses
+        # base income, gated by power for consumers that require it
+        for i in range(self.N):
+            for k in range(self.N):
+                t = int(self.grid[i, k])
+                if t in (0, ROAD):
+                    continue
+                props = BUILDINGS[t]
+                p_use = int(props.get("power_use", 0))
+                requires_power = p_use > 0
+                if requires_power and not self.powered[i, k]:
+                    continue
+                income += int(props.get("income", 0))
+        # road adjacency bonus for houses (only if the house is powered)
         bonus = 0
         for i in range(self.N):
             for k in range(self.N):
-                if self.grid[i,k] == HOUSE:
-                    for ni,nk in neighbors4(i,k,self.N):
-                        if self.grid[ni,nk] == ROAD: bonus += ADJ_BONUS_PER_ROAD_FOR_HOUSE
+                if self.grid[i, k] == HOUSE and self.powered[i, k]:
+                    for ni, nk in neighbors4(i, k, self.N):
+                        if self.grid[ni, nk] == ROAD:
+                            bonus += ADJ_BONUS_PER_ROAD_FOR_HOUSE
         income += bonus
         self.money += income
         return income
     # Instance data builders
     def build_instanced_arrays(self):
+        # Make sure power info is current so we can visualize powered/unpowered buildings
+        self.compute_power()
         bldg_offsets, bldg_colors = [], []
         road_offsets, road_colors = [], []
         for i in range(self.N):
@@ -354,7 +446,13 @@ class City:
                     road_offsets.append([i+0.5, 0.05, k+0.5])  # slightly above ground
                     road_colors.append(list(ROAD_COLOR))
                 else:
-                    bcol = BUILDINGS[t]["color"]
+                    base_col = BUILDINGS[t]["color"]
+                    p_use = int(BUILDINGS[t].get("power_use", 0))
+                    if p_use > 0 and not self.powered[i, k]:
+                        # Dim unpowered consumers
+                        bcol = tuple([c * 0.3 for c in base_col])
+                    else:
+                        bcol = base_col
                     bldg_offsets.append([i+0.5, 0.5, k+0.5])  # cube sits on plane
                     bldg_colors.append(list(bcol))
         def pack(offs, cols):
@@ -374,6 +472,7 @@ class City:
         self.money = int(data.get("money", 50))
         self.selected = int(data.get("selected", HOUSE))
         self._roads_dirty = self._bldg_dirty = True
+        self._power_dirty = True
     def save_npz(self, path):
         np.savez(path, N=self.N, money=self.money, selected=self.selected, grid=self.grid)
     def load_npz(self, path):
@@ -382,6 +481,7 @@ class City:
         self.grid = z["grid"].astype(np.int8)
         self.money = int(z["money"]); self.selected = int(z["selected"])
         self._roads_dirty = self._bldg_dirty = True
+        self._power_dirty = True
 
 # -------------- Citizens & A* --------------
 class Citizen:
@@ -615,13 +715,26 @@ def main():
                   FACTORY:int(np.sum(city.grid==FACTORY)),
                   POWERPLANT:int(np.sum(city.grid==POWERPLANT)),
                   ROAD:int(np.sum(city.grid==ROAD))}
+        # Power summary
+        need_power = 0
+        powered = 0
+        for i in range(GRID):
+            for k in range(GRID):
+                t = int(city.grid[i, k])
+                if t in (0, ROAD):
+                    continue
+                if int(BUILDINGS[t].get("power_use", 0)) > 0:
+                    need_power += 1
+                    if city.powered[i, k]:
+                        powered += 1
         return [
             f"Money: {city.money}",
             f"Selected [{sel}]: {name}",
             f"Counts: House={counts[HOUSE]} Farm={counts[FARM]} Factory={counts[FACTORY]} Power plant={counts[POWERPLANT]} Roads={counts[ROAD]}",
-            "Controls: 1/2/3=House/Farm/Factory, R=Road tool, LMB place, RMB remove",
+            f"Power: supply={city.power_supply} used={city.power_used} demand={city.power_demand} powered_buildings={powered}/{need_power}",
+            "Controls: 1/2/3/4=House/Farm/Factory/Plant, R=Road tool, LMB place, RMB remove",
             "           M toggle mouse capture, WASD/Space/C move, F5/F6 JSON save/load, F9/F10 NPZ",
-            "Adjacency: Houses +1 income per adjacent road (N/E/S/W). Citizens use roads."
+            "Adjacency: Houses +1 income per adjacent road (N/E/S/W). Citizens use roads. Roads transmit power."
         ]
 
     # Start with HUD text
@@ -775,6 +888,7 @@ def main():
             glEnableVertexAttribArray(2)
             glEnableVertexAttribArray(3)
             glBindVertexArray(0)
+        
         # HUD draw
         hud.update_text(hud_lines())
         glDisable(GL_DEPTH_TEST)
